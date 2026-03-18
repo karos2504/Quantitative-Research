@@ -20,7 +20,8 @@ def calculate_rsi(df, period=14):
         pd.DataFrame: Original DataFrame with 'RSI' column added.
     """
     df = df.copy()
-    delta = df['Adj Close'].diff().squeeze()
+    price_col = 'Close' if 'Close' in df.columns else 'Adj Close'
+    delta = df[price_col].diff().squeeze()
 
     gain = np.where(delta > 0, delta, 0)
     loss = np.where(delta < 0, -delta, 0)

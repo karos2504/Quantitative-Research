@@ -23,8 +23,9 @@ def calculate_macd(df, fast=12, slow=26, signal=9):
         pd.DataFrame: Original DataFrame with 'MACD', 'Signal', 'Hist' columns added.
     """
     df = df.copy()
-    ema_fast = df['Adj Close'].ewm(span=fast, min_periods=fast).mean()
-    ema_slow = df['Adj Close'].ewm(span=slow, min_periods=slow).mean()
+    price_col = 'Close' if 'Close' in df.columns else 'Adj Close'
+    ema_fast = df[price_col].ewm(span=fast, min_periods=fast).mean()
+    ema_slow = df[price_col].ewm(span=slow, min_periods=slow).mean()
 
     macd = ema_fast - ema_slow
     signal_line = macd.ewm(span=signal, min_periods=signal).mean()

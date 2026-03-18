@@ -8,6 +8,8 @@ from indicators.obv import calculate_obv
 from indicators.bollinger_bands import calculate_bollinger_bands
 from indicators.renko import convert_to_renko
 from indicators.slope import calculate_slope
+from indicators.vwap import calculate_vwap
+from indicators.stochastic import calculate_stochastic
 
 __all__ = [
     'calculate_atr',
@@ -18,4 +20,6 @@ __all__ = [
     'calculate_bollinger_bands',
     'convert_to_renko',
     'calculate_slope',
+    'calculate_vwap',
+    'calculate_stochastic',
 ]

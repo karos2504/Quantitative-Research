@@ -18,7 +18,8 @@ def calculate_obv(df):
         pd.DataFrame: Original DataFrame with 'OBV' column added.
     """
     df = df.copy()
-    returns = df['Adj Close'].pct_change()
+    price_col = 'Close' if 'Close' in df.columns else 'Adj Close'
+    returns = df[price_col].pct_change()
 
     direction = np.where(returns > 0, 1, np.where(returns < 0, -1, 0))
     direction[0] = 0

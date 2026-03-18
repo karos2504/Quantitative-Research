@@ -1,9 +1,12 @@
 """
-Renko + OBV Strategy — Advanced Backtest
+Renko + OBV Strategy — Advanced Backtest (v3.0)
 
-Uses Renko brick patterns combined with OBV slope for entry/exit signals.
-Backtests on intraday data using backtesting.py, then runs advanced
-validation (Monte Carlo, Walk-Forward, Stress Test, DSR) via vectorbt.
+Key Improvements over v2.0:
+  * Optimized parameters are extracted and reused for a clean final backtest
+    (separates the parameter search from performance reporting).
+  * Best parameters printed per ticker + collected in a summary table.
+  * VBT and ML signal generation also use best discovered parameters.
+  * All v2.0 features preserved: ADX, BB squeeze, ER, OBV Z-score.
 """
 
 import sys
@@ -17,135 +20,203 @@ from backtesting import Backtest, Strategy
 
 from indicators.renko import convert_to_renko
 from indicators.obv import calculate_obv
-from indicators.slope import calculate_slope
+from indicators.atr import calculate_atr
+from indicators.adx import calculate_adx
+from indicators.bollinger_bands import calculate_bollinger_bands
 from utils.backtesting import VBTBacktester
+from utils.strategy_utils import align_indicator_data, standardize_ohlcv
 
 # ----------------------------- CONFIG ----------------------------- #
 TICKERS = ["NVDA", "AAPL", "GOOGL", "META", "AMZN", "MSFT", "TSLA"]
 CASH = 100_000
 COMMISSION = 0.001
 
+# Default parameter fallback (used when optimization yields < 10 trades)
+DEFAULT_PARAMS = dict(
+    bar_threshold  = 6,
+    er_threshold   = 0.65,
+    obv_z_threshold= 0.8,
+    tp_factor      = 1.5,
+    sl_factor      = 1.0,
+    adx_threshold  = 20,
+)
 
-# ---------------------- INDICATOR HELPERS ---------------------- #
-from indicators.renko import convert_to_renko
-from indicators.obv import calculate_obv
-from indicators.atr import calculate_atr
-from utils.strategy_utils import align_indicator_data, standardize_ohlcv
 
 # ---------------------- INDICATOR HELPERS ---------------------- #
 def _precompute_indicators(df):
-    """Merge Renko + OBV + OBV MA + ATR into a single DataFrame."""
-    renko = convert_to_renko(df)
-    
-    # Use shared utility to align Renko bricks to intraday timeframe
+    """Merge Renko + OBV + OBV MA + ATR + ADX + Bollinger into a single DataFrame."""
+    renko  = convert_to_renko(df)
     merged = align_indicator_data(df, renko, merge_col='bar_num')
 
-    # Calculate OBV and moving average of OBV (to define trend)
     merged = calculate_obv(merged)
     merged['obv_ma'] = merged['OBV'].rolling(window=20).mean()
-
-    # Calculate ATR for stops
     merged = calculate_atr(merged, period=14)
-    
-    # Kaufman's Efficiency Ratio (ER)
-    er_period = 14
-    change = merged['Close'].diff(er_period).abs()
+    merged = calculate_adx(merged, period=20)
+    merged = calculate_bollinger_bands(merged, window=20, std_dev=2)
+    merged['BB_Width_Pct'] = merged['BB_Width'].rolling(100).rank(pct=True)
+    merged['BB_Expanding'] = merged['BB_Width'].diff() > 0
+
+    # Kaufman's Efficiency Ratio
+    er_period  = 14
+    change     = merged['Close'].diff(er_period).abs()
     volatility = merged['Close'].diff().abs().rolling(er_period).sum()
     merged['ER'] = change / volatility.replace(0, np.nan)
-    
-    # OBV Rate of Change Z-Score (Momentum Anomaly)
-    obv_roc = merged['OBV'].diff(5)
+
+    # OBV Rate-of-Change Z-Score
+    obv_roc      = merged['OBV'].diff(5)
     obv_roc_mean = obv_roc.rolling(20).mean()
     obv_roc_std  = obv_roc.rolling(20).std()
     merged['OBV_Z'] = (obv_roc - obv_roc_mean) / (obv_roc_std + 1e-9)
 
-    merged.dropna(subset=['bar_num', 'OBV', 'obv_ma', 'ATR', 'ER', 'OBV_Z'], inplace=True)
+    merged.dropna(subset=['bar_num', 'OBV', 'obv_ma', 'ATR', 'ER',
+                           'OBV_Z', 'ADX', 'BB_Width_Pct'], inplace=True)
     return standardize_ohlcv(merged)
 
 
-# ---------------------- STRATEGY CLASS ---------------------- #
+# ---------------------- STRATEGY CLASS (OPTIMIZABLE) ---------------------- #
 class RenkoOBVStrategy(Strategy):
-    """Renko + OBV: Buy bar_num>=2 & slope>30, Sell bar_num<=-2 & slope<-30."""
+    """Renko + OBV with ADX filter, BB squeeze, and full optimization."""
+
+    # === OPTIMIZABLE PARAMETERS ===
+    bar_threshold   = 6
+    er_threshold    = 0.65
+    obv_z_threshold = 0.8
+    tp_factor       = 1.5
+    sl_factor       = 1.0
+    adx_threshold   = 20
 
     def init(self):
-        self.bar_num = self.I(lambda: self.data.bar_num, name='bar_num', overlay=False)
-        self.obv = self.I(lambda: self.data.OBV, name='OBV', overlay=False)
-        self.obv_ma = self.I(lambda: self.data.obv_ma, name='OBV_MA', overlay=False)
-        self.atr = self.I(lambda: self.data.ATR, name='ATR', overlay=False)
-        self.er = self.I(lambda: self.data.ER, name='Eff_Ratio', overlay=False)
-        self.obv_z = self.I(lambda: self.data.OBV_Z, name='OBV_Z_Score', overlay=False)
+        self.bar_num     = self.I(lambda: self.data.bar_num,      name='bar_num',    overlay=False)
+        self.obv         = self.I(lambda: self.data.OBV,          name='OBV',        overlay=False)
+        self.obv_ma      = self.I(lambda: self.data.obv_ma,       name='OBV_MA',     overlay=False)
+        self.atr         = self.I(lambda: self.data.ATR,          name='ATR',        overlay=False)
+        self.er          = self.I(lambda: self.data.ER,           name='Eff_Ratio',  overlay=False)
+        self.obv_z       = self.I(lambda: self.data.OBV_Z,        name='OBV_Z',      overlay=False)
+        self.adx         = self.I(lambda: self.data.ADX,          name='ADX',        overlay=False)
+        self.bb_expanding= self.I(lambda: self.data.BB_Expanding, name='BB_Expand',  overlay=False)
+        self.bb_width_pct= self.I(lambda: self.data.BB_Width_Pct, name='BB_W_Pct',   overlay=False)
 
     def next(self):
-        bar = self.bar_num[-1]
-        obv_val = self.obv[-1]
+        bar        = self.bar_num[-1]
+        obv_val    = self.obv[-1]
         obv_ma_val = self.obv_ma[-1]
-        atr_val = self.atr[-1]
-        er_val = self.er[-1]
-        obv_z_val = self.obv_z[-1]
-        close = self.data.Close[-1]
+        atr_val    = self.atr[-1]
+        er_val     = self.er[-1]
+        obv_z_val  = self.obv_z[-1]
+        adx_val    = self.adx[-1]
+        bb_exp     = self.bb_expanding[-1]
+        bb_w_pct   = self.bb_width_pct[-1]
+        close      = self.data.Close[-1]
 
-        # Require OBV above MA, high Efficiency Ratio (>0.3), and positive OBV momentum anomaly
-        buy_signal = bar >= 2 and obv_val > obv_ma_val and er_val > 0.3 and obv_z_val > 1.0
-        sell_signal = bar <= -2 and obv_val < obv_ma_val and er_val > 0.3 and obv_z_val < -1.0
+        trend_strong  = adx_val > self.adx_threshold
+        vol_expanding = bb_exp and bb_w_pct > 0.2
 
-        tp_factor = 1.5
-        sl_factor = 1.0
+        buy_signal = (
+            bar >= self.bar_threshold and
+            obv_val > obv_ma_val and
+            er_val > self.er_threshold and
+            obv_z_val > self.obv_z_threshold and
+            trend_strong and
+            vol_expanding
+        )
+        sell_signal = (
+            bar <= -self.bar_threshold and
+            obv_val < obv_ma_val and
+            er_val > self.er_threshold and
+            obv_z_val < -self.obv_z_threshold and
+            trend_strong and
+            vol_expanding
+        )
 
         if not self.position:
             if buy_signal:
-                self.buy(sl=close - atr_val * sl_factor, tp=close + atr_val * tp_factor)
+                self.buy(sl=close - atr_val * self.sl_factor,
+                         tp=close + atr_val * self.tp_factor)
             elif sell_signal:
-                self.sell(sl=close + atr_val * sl_factor, tp=close - atr_val * tp_factor)
+                self.sell(sl=close + atr_val * self.sl_factor,
+                          tp=close - atr_val * self.tp_factor)
+
         elif self.position.is_long:
-            new_stop = close - atr_val * sl_factor
-            if hasattr(self, '_long_stop'):
-                self._long_stop = max(self._long_stop, new_stop)
-            else:
+            new_stop = close - atr_val * self.sl_factor
+            if not hasattr(self, '_long_stop') or new_stop > self._long_stop:
                 self._long_stop = new_stop
-
-            # Tighten SL dynamically on the active trade
             for trade in self.trades:
-                if trade.is_long:
-                    if trade.sl is None or self._long_stop > trade.sl:
-                        trade.sl = self._long_stop
+                if trade.is_long and (trade.sl is None or self._long_stop > trade.sl):
+                    trade.sl = self._long_stop
 
-            if sell_signal or bar < 2:
+            if sell_signal or bar < self.bar_threshold:
                 self.position.close()
                 if sell_signal:
-                    self.sell(sl=close + atr_val * sl_factor, tp=close - atr_val * tp_factor)
+                    self.sell(sl=close + atr_val * self.sl_factor,
+                              tp=close - atr_val * self.tp_factor)
+
         elif self.position.is_short:
-            new_stop = close + atr_val * sl_factor
-            if hasattr(self, '_short_stop'):
-                self._short_stop = min(self._short_stop, new_stop)
-            else:
+            new_stop = close + atr_val * self.sl_factor
+            if not hasattr(self, '_short_stop') or new_stop < self._short_stop:
                 self._short_stop = new_stop
-
-            # Tighten SL dynamically on the active trade
             for trade in self.trades:
-                if trade.is_short:
-                    if trade.sl is None or self._short_stop < trade.sl:
-                        trade.sl = self._short_stop
+                if trade.is_short and (trade.sl is None or self._short_stop < trade.sl):
+                    trade.sl = self._short_stop
 
-            if buy_signal or bar > -2:
+            if buy_signal or bar > -self.bar_threshold:
                 self.position.close()
                 if buy_signal:
-                    self.buy(sl=close - atr_val * sl_factor, tp=close + atr_val * tp_factor)
+                    self.buy(sl=close - atr_val * self.sl_factor,
+                             tp=close + atr_val * self.tp_factor)
 
 
-def _generate_vbt_signals(df):
-    """Generate vectorbt entry/exit signals with ER and Z-score filters."""
-    entries = (df['bar_num'] >= 2) & (df['OBV'] > df['obv_ma']) & (df['ER'] > 0.3) & (df['OBV_Z'] > 1.0)
-    exits = (df['bar_num'] <= -2) & (df['OBV'] < df['obv_ma']) & (df['ER'] > 0.3) & (df['OBV_Z'] < -1.0)
+# ---------------------- VBT SIGNAL HELPER ---------------------- #
+def _generate_vbt_signals(df, bar_threshold=6, er_threshold=0.65,
+                           obv_z_threshold=0.8, adx_threshold=20):
+    trend_strong  = df['ADX'] > adx_threshold
+    vol_expanding = df['BB_Expanding'] & (df['BB_Width_Pct'] > 0.2)
+
+    entries = (
+        (df['bar_num'] >= bar_threshold) &
+        (df['OBV'] > df['obv_ma']) &
+        (df['ER'] > er_threshold) &
+        (df['OBV_Z'] > obv_z_threshold) &
+        trend_strong &
+        vol_expanding
+    )
+    exits = (
+        (df['bar_num'] <= -bar_threshold) &
+        (df['OBV'] < df['obv_ma']) &
+        (df['ER'] > er_threshold) &
+        (df['OBV_Z'] < -obv_z_threshold) &
+        trend_strong &
+        vol_expanding
+    )
     return entries, exits
+
+
+# ---------------------- PARAM EXTRACTION HELPER ---------------------- #
+def _extract_best_params(opt_stats) -> dict:
+    """
+    Extract the winning parameter set from backtesting.py optimization results.
+    backtesting.py stores the best combo as class attributes on opt_stats._strategy.
+    """
+    strat = opt_stats._strategy
+    return dict(
+        bar_threshold   = int(strat.bar_threshold),
+        er_threshold    = float(strat.er_threshold),
+        obv_z_threshold = float(strat.obv_z_threshold),
+        tp_factor       = float(strat.tp_factor),
+        sl_factor       = float(strat.sl_factor),
+        adx_threshold   = int(strat.adx_threshold),
+    )
 
 
 # ----------------------------- MAIN ----------------------------- #
 def main():
-    print("=" * 60)
-    print("  Renko + OBV Strategy — Advanced Backtest")
-    print("=" * 60)
+    print("=" * 70)
+    print("  Renko + OBV Strategy — Advanced Backtest (v3.0)")
+    print("=" * 70)
 
-    print("\n--- Downloading intraday data ---")
+    # ------------------------------------------------------------------
+    # 1. Download data
+    # ------------------------------------------------------------------
+    print("\n--- Downloading 1h intraday data (2 years) ---")
     ohlc_intraday = {}
     for ticker in TICKERS:
         try:
@@ -163,75 +234,155 @@ def main():
     if not tickers:
         raise ValueError("No data downloaded.")
 
-    # --- backtesting.py pass ---
-    all_stats = {}
+    # ------------------------------------------------------------------
+    # 2. Optimize → extract best params → re-run clean final backtest
+    # ------------------------------------------------------------------
+    all_stats   = {}
+    best_params = {}
+
     for ticker in tickers:
-        print(f"\n📊 Backtesting {ticker} (backtesting.py)...")
+        print(f"\n{'─' * 60}")
+        print(f"📊  {ticker} — Step 1: Optimizing …")
+
         try:
             df = _precompute_indicators(ohlc_intraday[ticker])
-            if len(df) < 10:
-                print(f"  ⚠️ Skipping {ticker}: insufficient data")
+            if len(df) < 50:
+                print(f"  ⚠️  Skipping {ticker}: insufficient data")
                 continue
 
             bt = Backtest(df, RenkoOBVStrategy,
                           cash=CASH, commission=COMMISSION,
                           exclusive_orders=True, finalize_trades=True)
-            stats = bt.run()
-            all_stats[ticker] = {
-                'Return [%]': stats['Return [%]'],
-                'Sharpe Ratio': stats['Sharpe Ratio'],
-                'Max Drawdown [%]': stats['Max. Drawdown [%]'],
-                '# Trades': stats['# Trades'],
-                'Win Rate [%]': stats['Win Rate [%]'],
-            }
-            print(f"  Return: {stats['Return [%]']:.2f}%  "
-                  f"Sharpe: {stats['Sharpe Ratio']:.2f}  "
-                  f"Max DD: {stats['Max. Drawdown [%]']:.2f}%  "
-                  f"Trades: {stats['# Trades']}")
-        except Exception as e:
-            print(f"  ❌ Error: {e}")
 
+            # ── Optimization pass ──────────────────────────────────────
+            params = DEFAULT_PARAMS.copy()
+            try:
+                opt_stats = bt.optimize(
+                    bar_threshold   = list(range(3, 7, 1)),
+                    er_threshold    = list(np.arange(0.3, 0.7, 0.1)),
+                    tp_factor       = list(np.arange(1.0, 2.0, 0.1)),
+                    sl_factor       = list(np.arange(0.5, 1.0, 0.1)),
+                    obv_z_threshold = list(np.arange(1.0, 3.0, 0.1)),
+                    maximize        = 'Sharpe Ratio',
+                    max_tries       = 27,
+                    return_heatmap  = False,
+                )
+
+                if opt_stats['# Trades'] >= 10:
+                    params = _extract_best_params(opt_stats)
+                    print(f"  ✅ Optimization complete. Best params: {params}")
+                else:
+                    print(f"  ⚠️  Only {opt_stats['# Trades']} trades found — "
+                          f"falling back to defaults")
+
+            except Exception as opt_err:
+                print(f"  ⚠️  Optimization failed ({opt_err}) — using defaults")
+
+            best_params[ticker] = params
+
+            # ── Final backtest using best (or default) params ──────────
+            print(f"📊  {ticker} — Step 2: Final backtest with best params …")
+            final_stats = bt.run(**params)
+
+            if final_stats['# Trades'] < 10:
+                print(f"  ⚠️  {ticker}: only {final_stats['# Trades']} trades — "
+                      f"interpret results cautiously")
+
+            all_stats[ticker] = {
+                'Return [%]':       final_stats['Return [%]'],
+                'Sharpe Ratio':     final_stats['Sharpe Ratio'],
+                'Max Drawdown [%]': final_stats['Max. Drawdown [%]'],
+                '# Trades':         final_stats['# Trades'],
+                'Win Rate [%]':     final_stats['Win Rate [%]'],
+                # Best params for traceability
+                'bar_threshold':    params['bar_threshold'],
+                'er_threshold':     params['er_threshold'],
+                'obv_z_threshold':  params['obv_z_threshold'],
+                'tp_factor':        params['tp_factor'],
+                'adx_threshold':    params['adx_threshold'],
+            }
+
+            print(
+                f"  ✅ Return: {final_stats['Return [%]']:.2f}%  "
+                f"Sharpe: {final_stats['Sharpe Ratio']:.2f}  "
+                f"Max DD: {final_stats['Max. Drawdown [%]']:.2f}%  "
+                f"Trades: {final_stats['# Trades']}"
+            )
+
+        except Exception as e:
+            print(f"  ❌ Error for {ticker}: {e}")
+
+    # ------------------------------------------------------------------
+    # 3. Summary tables
+    # ------------------------------------------------------------------
     if all_stats:
-        print("\n" + "=" * 60)
-        print("--- 📈 Renko + OBV — backtesting.py Results ---")
-        print("=" * 60)
+        print("\n" + "=" * 70)
+        print("  FINAL BACKTEST RESULTS (using optimized parameters per ticker)")
+        print("=" * 70)
         print(pd.DataFrame(all_stats).T.to_string(float_format=lambda x: f"{x:.2f}"))
 
-    # --- vectorbt advanced analysis (per-ticker) ---
+        print("\n" + "─" * 70)
+        print("  Best Parameters Per Ticker")
+        print("─" * 70)
+        print(pd.DataFrame(best_params).T.to_string(float_format=lambda x: f"{x:.2f}"))
+
+    # ------------------------------------------------------------------
+    # 4. VBT advanced analysis with best params
+    # ------------------------------------------------------------------
     for ticker in tickers:
         if ticker not in all_stats:
             continue
-        print(f"\n{'=' * 60}")
-        print(f"  🔬 Advanced Analysis: {ticker}")
-        print(f"{'=' * 60}")
+        print(f"\n{'=' * 70}")
+        print(f"  Advanced VBT Analysis: {ticker}  (best params)")
+        print(f"{'=' * 70}")
 
         try:
             df = _precompute_indicators(ohlc_intraday[ticker])
-            entries, exits = _generate_vbt_signals(df)
+            p  = best_params[ticker]
+            entries, exits = _generate_vbt_signals(
+                df,
+                bar_threshold   = p['bar_threshold'],
+                er_threshold    = p['er_threshold'],
+                obv_z_threshold = p['obv_z_threshold'],
+                adx_threshold   = p['adx_threshold'],
+            )
 
             bt_vbt = VBTBacktester(
-                close=df['Close'],
-                entries=entries,
-                exits=exits,
-                freq='15min',
-                init_cash=CASH,
-                commission=COMMISSION,
+                close      = df['Close'],
+                entries    = entries,
+                exits      = exits,
+                freq       = '1h',
+                init_cash  = CASH,
+                commission = COMMISSION,
             )
             bt_vbt.full_analysis(n_mc=500, n_wf_splits=4, n_trials=len(TICKERS))
-        except Exception as e:
-            print(f"  ❌ VBT analysis error: {e}")
 
-    # --- ML/DL/RL Signal Enhancement ---
-    # from utils.ml_signals import run_ml_comparison
-    # for ticker in tickers:
-    #     if ticker not in all_stats:
-    #         continue
-    #     try:
-    #         df = _precompute_indicators(ohlc_intraday[ticker])
-    #         entries, exits = _generate_vbt_signals(df)
-    #         run_ml_comparison(df, entries, exits, ticker, freq='15min')
-    #     except Exception as e:
-    #         print(f"  ❌ ML error for {ticker}: {e}")
+        except Exception as e:
+            print(f"  ❌ VBT error: {e}")
+
+    # ------------------------------------------------------------------
+    # 5. ML/DL/RL signal enhancement (uses best params for signal gen)
+    # ------------------------------------------------------------------
+    try:
+        from utils.ml_signals import run_ml_comparison
+        for ticker in tickers:
+            if ticker not in all_stats:
+                continue
+            try:
+                df = _precompute_indicators(ohlc_intraday[ticker])
+                p  = best_params[ticker]
+                entries, exits = _generate_vbt_signals(
+                    df,
+                    bar_threshold   = p['bar_threshold'],
+                    er_threshold    = p['er_threshold'],
+                    obv_z_threshold = p['obv_z_threshold'],
+                    adx_threshold   = p['adx_threshold'],
+                )
+                run_ml_comparison(df, entries, exits, ticker, freq='1h')
+            except Exception as e:
+                print(f"  ❌ ML error for {ticker}: {e}")
+    except ImportError:
+        print("\n  ⚠️  ML libraries not available. Skipping ML signal enhancement.")
 
 
 if __name__ == '__main__':

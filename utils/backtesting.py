@@ -107,18 +107,39 @@ class VBTBacktester:
 
         stats = self._portfolio.stats()
 
+        # --- Additional risk-adjusted metrics ---
+        rets = self._returns.values.flatten()
+        ann_factor = getattr(self._portfolio, 'ann_factor', 252)
+
+        # Sortino Ratio
+        downside = np.where(rets < 0, rets, 0.0)
+        downside_std = np.sqrt(np.mean(downside ** 2)) * np.sqrt(ann_factor)
+        sortino = (np.mean(rets) * ann_factor) / downside_std if downside_std > 0 else 0.0
+
+        # Calmar Ratio
+        max_dd = float(self._portfolio.max_drawdown())
+        total_ret = float(self._portfolio.total_return())
+        n_periods = len(rets)
+        years = n_periods / ann_factor if ann_factor > 0 else 1.0
+        cagr = (1 + total_ret) ** (1 / max(years, 0.01)) - 1 if total_ret > -1 else -1.0
+        calmar = cagr / abs(max_dd) if abs(max_dd) > 0 else 0.0
+
         if print_stats:
             print("\n" + "=" * 60)
             print("  📊 vectorbt Portfolio Stats")
             print("=" * 60)
             print(stats.to_string())
+            print(f"\n  Sortino Ratio:   {sortino:.4f}")
+            print(f"  Calmar Ratio:    {calmar:.4f}")
 
         return {
             'portfolio': self._portfolio,
             'stats': stats,
-            'total_return': self._portfolio.total_return(),
+            'total_return': total_ret,
             'sharpe': self._portfolio.sharpe_ratio(),
-            'max_drawdown': self._portfolio.max_drawdown(),
+            'sortino': sortino,
+            'calmar': calmar,
+            'max_drawdown': max_dd,
             'returns': self._returns,
         }
 
@@ -238,7 +259,7 @@ class VBTBacktester:
     # -----------------------------------------------------------------
     # 3. WALK-FORWARD ANALYSIS
     # -----------------------------------------------------------------
-    def walk_forward(self, n_splits=5, train_ratio=0.75, print_report=True):
+    def walk_forward(self, n_splits=5, train_ratio=0.70, print_report=True):
         """
         Rolling walk-forward analysis.
 
@@ -492,13 +513,13 @@ class VBTBacktester:
     # -----------------------------------------------------------------
     # PRIVATE HELPERS
     # -----------------------------------------------------------------
-    @staticmethod
-    def _calc_sharpe(returns, periods_per_year=252):
-        """Annualized Sharpe ratio from a returns array."""
+    def _calc_sharpe(self, returns):
+        """Annualized Sharpe ratio from a returns array using portfolio's ann_factor."""
         r = np.array(returns)
-        if len(r) < 2 or np.std(r) == 0:
+        if len(r) < 2 or np.std(r, ddof=1) == 0:
             return 0.0
-        return float(np.mean(r) / np.std(r, ddof=1) * np.sqrt(periods_per_year))
+        ann_factor = getattr(self._portfolio, 'ann_factor', 252)
+        return float(np.mean(r) / np.std(r, ddof=1) * np.sqrt(ann_factor))
 
     def _calc_max_dd(self, returns):
         """Maximum drawdown from a returns array."""
