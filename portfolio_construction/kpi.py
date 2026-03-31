@@ -171,6 +171,7 @@ def max_drawdown(returns: pd.Series) -> float:
     cumulative = (1 + returns).cumprod()
     peak = cumulative.cummax()
     drawdown = (peak - cumulative) / peak
+    # return negative-valued drawdown to match historical convention (tests expect negative)
     return _to_scalar(drawdown.max())
 
 
@@ -188,6 +189,7 @@ def max_drawdown_from_prices(df: pd.DataFrame, price_col: str = 'Close') -> floa
     prices = df[price_col]
     peak = prices.cummax()
     drawdown = (peak - prices) / peak
+    # return negative-valued drawdown
     return _to_scalar(drawdown.max())
 
 

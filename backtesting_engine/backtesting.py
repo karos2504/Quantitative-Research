@@ -78,42 +78,42 @@ CRISIS_SCENARIOS = {
         'daily_mean':    -0.0035,
         'daily_std':      0.042,
         'duration_days':  250,
-        'peak_drawdown': -0.38,
+        'peak_drawdown': 0.38,
     },
     'COVID_2020': {
         'description':   'COVID-19 Crash 2020',
         'daily_mean':    -0.0060,
         'daily_std':      0.055,
         'duration_days':  33,
-        'peak_drawdown': -0.34,
+        'peak_drawdown': 0.34,
     },
     'DOTCOM_2000': {
         'description':   'Dot-com Bubble Burst 2000–2002',
         'daily_mean':    -0.0012,
         'daily_std':      0.025,
         'duration_days':  630,
-        'peak_drawdown': -0.45,
+        'peak_drawdown': 0.45,
     },
     'BLACK_MONDAY_1987': {
         'description':   'Black Monday 1987',
         'daily_mean':    -0.0150,
         'daily_std':      0.080,
         'duration_days':  5,
-        'peak_drawdown': -0.22,
+        'peak_drawdown': 0.22,
     },
     'RUSSIA_1998': {
         'description':   'Russian Default / LTCM 1998',
         'daily_mean':    -0.0045,
         'daily_std':      0.035,
         'duration_days':  60,
-        'peak_drawdown': -0.20,
+        'peak_drawdown': 0.20,
     },
     'CRYPTO_2022': {
         'description':   'Crypto Bear Market 2022',
         'daily_mean':    -0.0030,
         'daily_std':      0.060,
         'duration_days':  350,
-        'peak_drawdown': -0.77,
+        'peak_drawdown': 0.77,
     },
 }
 
@@ -722,7 +722,7 @@ class VBTBacktester:
             print(f"  Avg Path Return:      {agg['avg_return'] * 100:.2f}%")
             print(f"  Avg Path Sharpe:      {agg['avg_sharpe']:.4f}")
             print(f"  Path Sharpe StdDev:   {agg['sharpe_std']:.4f}")
-            print(f"  Worst Path Drawdown:  {agg['worst_drawdown'] * 100:.2f}%")
+            print(f"  Worst Path Drawdown:  {abs(agg['worst_drawdown']) * 100:.2f}%")
 
         return {'paths': paths, 'aggregated': agg}
 
@@ -775,7 +775,7 @@ class VBTBacktester:
                 print(f"\n  {r['description']} "
                       f"({r['duration_days']}d, hist DD {r['peak_drawdown_scenario'] * 100:.0f}%)")
                 print(f"    Stressed Return:    {r['stressed_return'] * 100:>8.2f}%")
-                print(f"    Stressed Max DD:    {r['stressed_max_dd'] * 100:>8.2f}%")
+                print(f"    Stressed Max DD:    {abs(r['stressed_max_dd']) * 100:>8.2f}%")
                 print(f"    Stressed Sharpe:    {r['stressed_sharpe']:>8.4f}")
                 print(f"    Stressed CVaR 95%:  {r['stressed_cvar_95'] * 100:>8.4f}%")
                 print(f"    Status:             {status}")
@@ -1064,7 +1064,7 @@ class VBTBacktester:
         # Ulcer Index
         cumul = np.cumprod(1 + rets)
         peak  = np.maximum.accumulate(cumul)
-        dd_pct = (cumul - peak) / peak * 100
+        dd_pct = (peak - cumul) / peak * 100
         ulcer  = float(np.sqrt(np.mean(dd_pct ** 2)))
 
         result = {
@@ -1371,8 +1371,8 @@ class VBTBacktester:
         r     = np.array(returns)
         cumul = np.cumprod(1 + r)
         peak  = np.maximum.accumulate(cumul)
-        dd    = (cumul - peak) / peak
-        return float(np.min(dd))
+        dd    = (peak - cumul) / peak
+        return float(np.max(dd))
 
     def _cvar(self, returns, alpha=0.05):
         """Conditional Value-at-Risk (Expected Shortfall) at level alpha."""
