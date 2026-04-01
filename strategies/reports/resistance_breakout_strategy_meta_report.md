@@ -43,9 +43,9 @@
 - **Information Ratio:** 0.1734
 
 ## 🎲 Monte Carlo Analysis
-- **P-value (Return):** 0.5180
-- **P-value (Sharpe):** 0.5220
-- **P-value (vs Random):** 0.0140
+- **P-value (Return):** 0.5160
+- **P-value (Sharpe):** 0.5060
+- **P-value (vs Random):** 0.0120
 
 ## 🔄 Sub-period Analysis
 | Window | Period | Return | Sharpe | Max DD |
@@ -58,12 +58,12 @@
 ## 🔥 Stress Test Performance
 | Scenario | Stressed Return | Max DD | Status |
 | :--- | :--- | :--- | :--- |
-| Global Financial Crisis 2008 | 60.00% | -76.45% | Survived |
-| COVID-19 Crash 2020 | 249.47% | -19.16% | Survived |
-| Dot-com Bubble Burst 2000–2002 | -29.57% | -70.13% | Survived |
-| Black Monday 1987 | 147.61% | -31.73% | Survived |
-| Russian Default / LTCM 1998 | 97.27% | -42.79% | Survived |
-| Crypto Bear Market 2022 | -67.05% | -94.38% | Survived |
+| Global Financial Crisis 2008 | -75.94% | 92.73% | Survived |
+| COVID-19 Crash 2020 | 55.21% | 50.71% | Survived |
+| Dot-com Bubble Burst 2000–2002 | 55.94% | 57.53% | Survived |
+| Black Monday 1987 | 216.17% | 20.40% | Survived |
+| Russian Default / LTCM 1998 | 115.25% | 43.23% | Survived |
+| Crypto Bear Market 2022 | -4.25% | 68.20% | Survived |
 
 ## 🏦 Trade-Level Analysis
 - **Total Trades:** 2
@@ -81,15 +81,15 @@
 ### Volatility Regimes
 | Regime | Return | Sharpe | Max DD | N |
 | :--- | :--- | :--- | :--- | :--- |
-| Low Vol | 1.15% | 0.1788 | -7.20% | 626 |
-| Med Vol | 17.49% | 1.2311 | -14.06% | 643 |
-| High Vol | 31.41% | 1.1256 | -22.08% | 626 |
+| Low Vol | 1.15% | 0.1788 | 7.20% | 626 |
+| Med Vol | 17.49% | 1.2311 | 14.06% | 643 |
+| High Vol | 31.41% | 1.1256 | 22.08% | 626 |
 
 ### Trend Regimes
 | Regime | Return | Sharpe | Max DD | N |
 | :--- | :--- | :--- | :--- | :--- |
-| Bull | 49.74% | 2.6573 | -7.05% | 1178 |
-| Bear | -36.63% | -2.1295 | -68.84% | 736 |
+| Bull | 49.74% | 2.6573 | 7.05% | 1178 |
+| Bear | -36.63% | -2.1295 | 68.84% | 736 |
 
 ## ⚖️ Extended Risk Metrics
 - **Omega Ratio:** 1.2417

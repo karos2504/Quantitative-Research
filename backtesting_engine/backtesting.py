@@ -147,8 +147,8 @@ class VBTBacktester:
         exits=None,
         freq='D',
         init_cash=100_000,
-        commission=0.001,
-        slippage=0.001,
+        commission:   float = 0.001,
+        slippage:     float = 0.0005,
         lag_signals=True,
         crypto_24_7=False,
     ):

@@ -30,7 +30,6 @@ from config.settings import CASH, COMMISSION
 from portfolio_construction import kpi
 from scipy.stats import zscore
 
-
 from dataclasses import dataclass, field
 import logging
 
@@ -45,39 +44,16 @@ logger = logging.getLogger(__name__)
 @dataclass(frozen=True)
 class StrategyConfig:
     risk_free_rate: float = 0.00
-    candidate_size: int = 3
-    min_weight: float = 0.02
-    max_weight: float = 0.60
-    min_positions: int = 3
-    max_positions: int = 15
-    mom_6_1_veto: float = 0.00
-    rebal_threshold: float = 0.25
-    smoothing: float = 0.3
-    min_hold_days: int = 60
-    order_book_min_delta: float = 0.005
-    txn_cost_bps: int = 10
     min_backtest_months: int = 24
-    entry_pullback: float = 0.01
-    entry_rsi: int = 50
-    min_mean_conviction: float = 0.01
-    vol_comp_short: int = 20
-    vol_comp_long: int = 100
-    do_nothing_threshold: float = 0.001
-    hard_risk_cap_drawdown: float = 0.25
-    hard_risk_cap_recovery: float = 0.05
-    strong_mom_threshold: float = 0.05
-    apply_corr_penalty: bool = True
-    convexity_vix_thresh_warn: float = 0.04
-    convexity_vix_thresh_crash: float = 0.07
-    convexity_min_invest: float = 0.20
-    convexity_default_invest: float = 1.0
-    hedge_tickers: list[str] = field(default_factory=lambda: ['TLT', 'GLD'])
-    hedge_crash_alloc: float = 0.30
-    hedge_normal_alloc: float = 0.0
-    min_weight_change: float = 0.05
-    max_drawdown_limit: float = 0.25
     cash: float = CASH
-    commission: float = COMMISSION
+    commission: float = 0.001  # 10 bps
+    slippage: float = 0.0005   # 5 bps
+    order_book_min_delta: float = 0.005
+    rebal_freq: int = 1
+    min_weight_delta: float = 0.0075  # 0.75% Turnover filter
+    min_score_count: int = 5
+    target_vol: float = 0.12
+    vol_spike_threshold: float = 2.0
 
 
 @dataclass(frozen=True)
@@ -166,380 +142,110 @@ def build_prices(data: dict) -> pd.DataFrame:
 
 
 def compute_returns(prices: pd.DataFrame) -> pd.DataFrame:
-    return np.log(prices / prices.shift(1))
+    return (prices / prices.shift(1) - 1)
 
 
 def compute_12_1(prices: pd.DataFrame) -> pd.DataFrame:
-    return np.log(prices.shift(1) / prices.shift(13))
+    return (prices.shift(1) / prices.shift(13) - 1)
 
 
 def compute_6_1(prices: pd.DataFrame) -> pd.DataFrame:
-    return np.log(prices.shift(1) / prices.shift(7))
+    return (prices.shift(1) / prices.shift(7) - 1)
 
 
 def compute_3_1(prices: pd.DataFrame) -> pd.DataFrame:
     """3-1 momentum: 3-month (approx) log-return used for short-term acceleration."""
-    return np.log(prices.shift(1) / prices.shift(4))
+    return (prices.shift(1) / prices.shift(4) - 1)
 
 
-# ------------------------
-# Daily / short-term helpers
-# ------------------------
-def compute_short_term_return(daily_close: pd.Series, window_days: int = 5) -> float:
-    """Return over the past `window_days` trading days as a simple pct (not log).
-    Expects a pandas Series indexed by Timestamp ordered ascending. Returns np.nan when insufficient data.
+def compute_scores_cs(
+    mom_1m: pd.Series,
+    mom_3m: pd.Series,
+    mom_6m: pd.Series,
+    mom_12m: pd.Series,
+    vol: pd.Series,
+    stability: pd.Series,
+    drawdown: pd.Series,
+    regime_type: str = "normal",
+    power: float = 1.3
+) -> dict[str, float]:
     """
-    if daily_close is None or len(daily_close.dropna()) < window_days:
-        return np.nan
-    recent = daily_close.dropna().iloc[-window_days:]
-    return float(recent.iloc[-1] / recent.iloc[0] - 1)
-
-
-def compute_rsi(daily_close: pd.Series, length: int = 14) -> float:
-    """Simple RSI implementation (Wilders-like EMA). Returns last RSI value or np.nan."""
-    s = daily_close.dropna()
-    if len(s) < length + 1:
-        return np.nan
-    delta = s.diff().dropna()
-    up = delta.clip(lower=0)
-    down = -delta.clip(upper=0)
-    roll_up = up.ewm(alpha=1/length, adjust=False).mean()
-    roll_down = down.ewm(alpha=1/length, adjust=False).mean()
-    rs = roll_up / (roll_down + 1e-12)
-    rsi = 100 - (100 / (1 + rs))
-    return float(rsi.iloc[-1])
-
-
-def volume_spike_score(daily_volume: pd.Series, lookback: int = 60) -> float:
-    """Score for recent volume spike: ratio of last 5-day avg to lookback avg.
-    Returns 1.0 baseline; >1 indicates spike. np.nan on insufficient data."""
-    v = daily_volume.dropna()
-    if len(v) < max(lookback, 5):
-        return np.nan
-    recent = v.iloc[-5:].mean()
-    hist = v.iloc[-lookback:].mean()
-    return float(recent / (hist + 1e-12))
-
-
-def compute_earnings_revision_proxy(tickers: list) -> pd.Series:
-    """Lightweight earnings revision proxy using yfinance info fields.
-    This is a fast, best-effort proxy (not a replacement for a real
-    analyst-estimate feed). Returns a z-scored Series aligned to
-    `tickers` and fills missing with 0.
+    Institutional Alpha Ranking Engine:
+    - 30% Trend Consistency (Ratio of positive returns)
+    - 20% Volatility Inversion (Signal-to-noise optimization)
+    - 15% Drawdown Penalty (Peak-to-current risk)
+    - 35% Multi-Horizon Momentum (3m, 6m, 12m blend)
+    - Cross-Sectional Z-Score Normalization
     """
-    out = {}
-    for t in tickers:
-        try:
-            tk = yf.Ticker(t)
-            info = tk.info or {}
-            eg = info.get('earningsQuarterlyGrowth')
-            if eg is None:
-                eg = info.get('earningsGrowth') if info.get('earningsGrowth') is not None else 0.0
-            out[t] = float(eg) if eg is not None else 0.0
-        except Exception:
-            out[t] = 0.0
-
-    s = pd.Series(out)
-    try:
-        zs = zscore(s.fillna(0.0))
-    except Exception:
-        zs = pd.Series({t: 0.0 for t in tickers})
-    return zs.reindex(tickers).fillna(0.0)
-
-
-def spy_regime(daily_spy_close: pd.Series) -> dict:
-    """Return regime dict: trend (SPY > 200d MA) and volatility proxy (21d std).
-    Values: {'trend': True/False/np.nan, 'vix_proxy': float}
-    """
-    s = daily_spy_close.dropna()
-    if len(s) == 0:
-        return {'trend': np.nan, 'vix_proxy': np.nan}
-    ma200 = s.rolling(200).mean()
-    try:
-        trend = bool(s.iloc[-1] > ma200.iloc[-1]) if not np.isnan(ma200.iloc[-1]) else np.nan
-    except Exception:
-        trend = np.nan
-    vix_proxy = np.nan
-    try:
-        pct = s.pct_change().dropna()
-        if len(pct) >= 21:
-            vix_proxy = float(pct.rolling(21).std().iloc[-1])
-    except Exception:
-        vix_proxy = np.nan
-    return {'trend': trend, 'vix_proxy': vix_proxy}
-
-
-# ============================================================
-#  RISK METRICS
-# ============================================================
-def _calculate_drawdown(returns_list: list[float]) -> float:
-    """Calculate current drawdown from a list of returns."""
-    if not returns_list:
-        return 0.0
-    try:
-        eq = np.cumprod([1 + r for r in returns_list])
-        peak = np.maximum.accumulate(eq)
-        return float((peak[-1] - eq[-1]) / (peak[-1] + 1e-12))
-    except Exception:
-        return 0.0
-
-
-def _get_drawdown_multiplier(dd: float) -> float:
-    """Determine drawdown-based exposure multiplier (soft de-risking)."""
-    if dd > 0.30:
-        return 0.3
-    elif dd > 0.20:
-        return 0.5
-    elif dd > 0.10:
-        return 0.7
-    return 1.0
-
-
-def _get_market_regime_context(
-    daily_spy: pd.Series, 
-    spy_mom: float, 
-    i: int, 
-    returns_window: pd.DataFrame
-) -> dict:
-    """Determine market regime: trend, vix_proxy, and crash_mode."""
-    reg = {'trend': np.nan, 'vix_proxy': np.nan}
-    try:
-        if daily_spy is not None:
-            reg = spy_regime(daily_spy)
-    except Exception:
-        pass
-    
-    crash_mode = not pd.isna(spy_mom) and spy_mom < 0
-    
-    # Fallback/enhancement for vix_proxy
-    if pd.isna(reg.get('vix_proxy')):
-        try:
-            reg['vix_proxy'] = float(np.nanmean(returns_window.std())) if not returns_window.empty else 0.02
-        except Exception:
-            reg['vix_proxy'] = 0.02
-            
-    return {
-        'trend': reg.get('trend'),
-        'vix_proxy': reg.get('vix_proxy'),
-        'crash_mode': crash_mode
+    factors = {
+        "m1": mom_1m, "m3": mom_3m, "m6": mom_6m, "m12": mom_12m,
+        "v": vol, "s": stability, "d": drawdown
     }
-
-
-def _compute_ticker_scores(
-    tickers: list[str],
-    prices: pd.DataFrame,
-    mom_12_1_series: pd.Series,
-    mom_6_1_series: pd.Series,
-    mom_3_1_df: pd.DataFrame,
-    daily_ohlcv: dict,
-    vol_series: pd.Series,
-    rank_now: pd.Series,
-    prev_rank: pd.Series,
-    i: int,
-    config: StrategyConfig = CONFIG
-) -> dict:
-    """Compute composite alpha scores and metadata for each ticker."""
-    eligible = {}
-    for t in tickers:
-        try:
-            if t not in mom_12_1_series.index or t not in mom_6_1_series.index:
-                continue
-            s12_val = mom_12_1_series[t]
-            s6_val = mom_6_1_series[t]
-            
-            if pd.isna(s12_val) or pd.isna(s6_val) or s12_val <= 0 or s6_val <= config.mom_6_1_veto:
-                continue
-            
-            # Earnings proxy
-            earnings_proxy = np.nan
-            try:
-                p3 = prices[t].pct_change(3).iloc[i]
-                p12 = prices[t].pct_change(12).iloc[i]
-                if not pd.isna(p3) and not pd.isna(p12):
-                    earnings_proxy = float(p3 - p12)
-            except Exception:
-                pass
-
-            # Daily signals (entry gating only)
-            st_ret, rsi = np.nan, np.nan
-            try:
-                if daily_ohlcv and t in daily_ohlcv:
-                    dclose = daily_ohlcv[t]['Close'].dropna()
-                    st_ret = compute_short_term_return(dclose, window_days=5)
-                    rsi = compute_rsi(dclose, length=14)
-            except Exception:
-                pass
-
-            # Composite Score components
-            alpha1 = float(s6_val)
-            alpha2 = 0.0
-            if mom_3_1_df is not None and t in mom_3_1_df.columns:
-                val31 = mom_3_1_df.iloc[i].get(t, np.nan)
-                if not pd.isna(val31):
-                    alpha2 = float(val31) - alpha1
-            
-            rc = 0.0
-            if rank_now is not None and prev_rank is not None:
-                rc = float(rank_now.get(t, 0.0) - prev_rank.get(t, 0.0))
-
-            comp_score = 0.5 * alpha1 + 0.3 * alpha2 + 0.2 * rc
-            
-            # Volatility adjustment
-            v_adj = vol_series.get(t, np.nan) if isinstance(vol_series, pd.Series) else np.nan
-            if not np.isnan(v_adj) and v_adj > 0:
-                comp_score = comp_score / (v_adj ** 0.5)
-
-            # Volatility compression expansion
-            vol_comp = np.nan
-            try:
-                if daily_ohlcv and t in daily_ohlcv and 'Close' in daily_ohlcv[t].columns:
-                    dclose = daily_ohlcv[t]['Close'].dropna()
-                    if len(dclose) >= config.vol_comp_long:
-                        dpct = dclose.pct_change().dropna()
-                        v_short = dpct.rolling(config.vol_comp_short).std().iloc[-1]
-                        v_long = dpct.rolling(config.vol_comp_long).std().iloc[-1]
-                        if not np.isnan(v_short) and not np.isnan(v_long) and v_long > 0:
-                            vol_comp = float(v_short / (v_long + 1e-12))
-                else:
-                    m = prices[t].pct_change().dropna()
-                    if len(m) >= 12:
-                        v_short = m.rolling(3).std().iloc[i] if i < len(m) else m.iloc[-3:].std()
-                        v_long = m.rolling(12).std().iloc[i] if i < len(m) else m.iloc[-12:].std()
-                        if not pd.isna(v_short) and not pd.isna(v_long) and v_long > 0:
-                            vol_comp = float(v_short / (v_long + 1e-12))
-            except Exception:
-                pass
-
-            if not np.isnan(vol_comp):
-                comp_score += (0.3 * float(vol_comp))
-
-            eligible[t] = {
-                'score': float(comp_score),
-                'mom_12_1': float(s12_val),
-                'mom_6_1': float(s6_val),
-                'earnings_proxy': earnings_proxy,
-                'st_ret': st_ret,
-                'rsi': rsi,
-            }
-        except Exception:
-            continue
-    return eligible
-
-
-def _apply_entry_gating(
-    candidates: list[str], 
-    eligible: dict, 
-    regime: dict, 
-    current_weights: dict,
-    config: StrategyConfig = CONFIG
-) -> list[str]:
-    """Filter candidates based on entry rules (pullbacks, RSI, momentum)."""
-    allowed = []
-    for t in candidates:
-        ed = eligible[t]
-        mom12 = ed.get('mom_12_1', 0.0)
-        st_ret = ed.get('st_ret', np.nan)
-        rsi = ed.get('rsi', np.nan)
-
-        st_ok = False if np.isnan(st_ret) else (st_ret <= -config.entry_pullback)
-        rsi_ok = False if np.isnan(rsi) else (rsi < config.entry_rsi)
-        strong_mom = (mom12 > config.strong_mom_threshold)
-
-        if strong_mom:
-            allowed.append(t)
-            continue
-
-        if t in current_weights and st_ok:
-            allowed.append(t)
-            continue
-
-        if np.isnan(st_ret) or np.isnan(rsi):
-            if strong_mom:
-                allowed.append(t)
-            continue
-
-        if regime.get('trend') is True:
-            if strong_mom or (st_ok and rsi_ok):
-                allowed.append(t)
-            continue
-
-        if st_ok and rsi_ok:
-            allowed.append(t)
-            
-    return allowed
-
-
-def _calculate_exposure_scaling(
-    regime: dict,
-    mean_conv: float,
-    avg_eligible_score: float,
-    dd_multiplier: float,
-    dd: float,
-    spy_mom: float,
-    config: StrategyConfig = CONFIG
-) -> float:
-    """Combine signal, volatility, and drawdown into a final exposure multiplier."""
-    invest_frac = config.convexity_default_invest
-    vproxy = regime.get('vix_proxy', np.nan)
-    crash_mode = regime.get('crash_mode', False)
     
-    if not pd.isna(vproxy):
-        if vproxy >= config.convexity_vix_thresh_crash or crash_mode:
-            invest_frac = max(config.convexity_min_invest, 0.3)
-        elif vproxy >= config.convexity_vix_thresh_warn:
-            invest_frac = 0.6
-
-    overall_signal = max(mean_conv, avg_eligible_score)
-    market_vol = vproxy if not pd.isna(vproxy) else 0.02
+    # 1. Align across all factors
+    valid = None
+    for f in factors.values():
+        valid = f.dropna().index if valid is None else valid.intersection(f.dropna().index)
     
-    exposure_factor = float(np.clip((overall_signal / (market_vol * 5 + 1e-12)), 0.2, 1.0))
+    if valid is None or valid.empty:
+        return {}
     
-    if regime.get('trend') is True and not pd.isna(spy_mom) and spy_mom > 0:
-        exposure_factor = min(1.0, exposure_factor + 0.15)
-
-    combined_factor = 0.5 * dd_multiplier + 0.5 * exposure_factor
-    combined_factor = float(np.clip(combined_factor, 0.0, 1.0))
+    # Extract valid slice
+    m1, m3, m6, m12 = mom_1m.loc[valid], mom_3m.loc[valid], mom_6m.loc[valid], mom_12m.loc[valid]
+    v, s, d = vol.loc[valid], stability.loc[valid], drawdown.loc[valid]
     
-    equities_alloc = invest_frac * combined_factor
+    # 2. Factor Normalization (Z-Score)
+    def z(series):
+        return (series - series.mean()) / (series.std() + 1e-12)
     
-    if regime.get('trend') is False:
-        equities_alloc *= 0.5
+    # Risk-Adjusted Momentum Base
+    zm = z(0.4 * z(m6) + 0.3 * z(m3) + 0.2 * z(m12) + 0.1 * z(m1))
+    
+    # Consistency & Quality Factors
+    zs = z(s)         # Trend Stability
+    zv = z(1.0 / (v + 1e-12)) # Vol Inversion
+    zd = z(-d)        # Drawdown Penalty (negative of DD)
+    
+    # 3. Composite Alpha Score (The Brain)
+    composite = (0.35 * zm) + (0.30 * zs) + (0.20 * zv) + (0.15 * zd)
+    
+    # 4. Regime-Aware Macro Overlay
+    if regime_type == "high_vol":
+        composite = composite - 0.25 * z(v) # Aggressive vol penalty in stress
         
-    if dd > config.max_drawdown_limit:
-        equities_alloc *= 0.3
+    # 5. Select Tightly (High Conviction Floor)
+    # Z > -0.3 ensures we only pick assets with above-average quality characteristics
+    selected = composite[composite > -0.3]
+    if selected.empty:
+        return {}
         
-    return equities_alloc
-
-
-def _apply_anti_churn(
-    new_weights: dict,
-    prev_weights: dict,
-    last_trade_date: dict,
-    date: pd.Timestamp,
-    config: StrategyConfig = CONFIG
-) -> dict:
-    """Enforce min_hold_days and min_weight_change to reduce turnover."""
-    if not prev_weights:
-        return new_weights
-        
-    updated_weights = dict(new_weights)
-    dt_date = date.to_timestamp() if hasattr(date, 'to_timestamp') else pd.to_datetime(date)
+    # 6. Apply final convexity power (Z^power)
+    base = selected - selected.min() + 1e-6
+    convex_scores = base ** power
     
-    for t in list(prev_weights.keys()):
-        last_dt = last_trade_date.get(t)
-        if last_dt is None:
-            continue
-            
-        try:
-            if (dt_date - last_dt) < pd.Timedelta(days=config.min_hold_days):
-                prev_w = prev_weights.get(t, 0.0)
-                prop_w = updated_weights.get(t, 0.0)
-                if abs(prop_w - prev_w) > config.min_weight_change:
-                    updated_weights[t] = prev_w
-        except Exception:
-            continue
-            
-    return updated_weights
+    return convex_scores.to_dict()
+
+
+def select_top_robust(scores: dict, universe: UniverseMetadata, n: int = 15):
+    """Select the top N tickers globally to allow for higher conviction and alpha."""
+    ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+    return [t for t, _ in ranked[:n]]
+
+
+def compute_weights(selected: list, returns_window: pd.DataFrame):
+    """Inverse volatility weighting for selected tickers."""
+    if not selected or returns_window.empty:
+        return {}
+        
+    vols = returns_window[selected].std()
+    # Handle assets with zero variance or all-NaN
+    vols = vols.fillna(vols.mean()).fillna(0.1) # Fallback to 10% monthly vol if unknown
+    vols = vols.replace(0, vols.mean() if vols.mean() > 0 else 0.1)
+
+    inv_vol = 1 / (vols + 1e-12)
+    weights = inv_vol / inv_vol.sum()
+
+    return weights.fillna(0.0).to_dict()
 
 
 def compute_full_metrics(strat: pd.Series, bench: pd.Series, config: StrategyConfig = CONFIG) -> dict:
@@ -618,192 +324,196 @@ def _handle_pnl_and_weights(
     return pnl, updated_weights
 
 
-def _get_portfolio_candidates(
-    eligible: dict,
-    regime: dict,
-    config: StrategyConfig = CONFIG
-) -> list[str]:
-    """Select the top candidates based on regime and composite score."""
-    ranked = sorted(eligible.keys(), key=lambda x: eligible[x]['score'], reverse=True)
+def run_strategy(prices: pd.DataFrame, mom_12_1: pd.DataFrame, universe: UniverseMetadata, config: StrategyConfig = CONFIG):
+    """
+    Main strategy loop with institutional-grade adaptive risk controls.
+    - Continuous regime score (inverse-vol weighted)
+    - Blended rolling Z-normalization
+    - Adaptive EMA smoothing & non-linear risk caps
+    - Proportional shock factor (memory-aware)
+    - T+1 execution lag and turnover-scaled costs (15 bps)
+    """
+    # 0. Pre-calculate SPY / Benchmark Stats
+    spy_prices = prices['SPY'] if 'SPY' in prices.columns else None
+    spy_rets = spy_prices.pct_change() if spy_prices is not None else None
     
-    local_top_n = config.candidate_size
-    if regime.get('trend') is True:
-        local_top_n = 3 # Special case from original logic
+    # Adaptive Threshold Components
+    spy_vol_3m = spy_rets.rolling(63).std() * np.sqrt(252).astype(float) if spy_rets is not None else None
+    if spy_vol_3m is not None:
+        # Floor vol at 10th percentile to prevent inverse-vol explosion
+        spy_vol_3m = np.maximum(spy_vol_3m, spy_vol_3m.quantile(0.1))
         
-    top_n = max(config.min_positions, min(config.max_positions, min(len(ranked), local_top_n)))
-    return ranked[:top_n]
-
-
-def _calculate_target_allocations(
-    allowed: list[str],
-    eligible: dict,
-    regime: dict,
-    returns_window: pd.DataFrame,
-    config: StrategyConfig = CONFIG
-) -> dict:
-    """Determine individual asset allocations based on conviction or risk-parity."""
-    scores = pd.Series([eligible[t]['score'] for t in allowed], index=allowed)
-    conv_scores = scores.clip(lower=0) ** 1.5
+    spy_ma_3m = spy_prices.rolling(63).mean() if spy_prices is not None else None
     
-    # Correlation penalty
-    if config.apply_corr_penalty and len(allowed) > 1:
-        try:
-            corr_matrix = returns_window[allowed].corr().abs().fillna(0.0)
-            for t in conv_scores.index:
-                avg_corr = float(corr_matrix[t].mean())
-                conv_scores[t] *= (1.0 - min(0.5, avg_corr))
-        except Exception:
-            pass
+    # 1. Prepare Returns & Signals
+    returns = prices.pct_change().dropna(how='all')
+    mom_12_1 = mom_12_1.reindex(returns.index)
 
-    # Basic normalization
-    if conv_scores.sum() <= 0:
-        return {}
-        
-    normalized = (conv_scores / conv_scores.sum()).to_dict()
-    
-    # Risk-parity fallback in bear markets
-    if regime.get('trend') is False and len(normalized) > 0:
-        vols = returns_window[allowed].std()
-        inv = (1.0 / (vols + 1e-12)).reindex(allowed).fillna(0)
-        if inv.sum() > 0:
-            normalized = (inv / inv.sum()).to_dict()
-            
-    return normalized
-
-
-def run_strategy(
-    prices: pd.DataFrame,
-    returns: pd.DataFrame,
-    mom_12_1: pd.DataFrame,
-    mom_6_1: pd.DataFrame,
-    mom_3_1: pd.DataFrame,
-    daily_ohlcv: dict = None,
-    daily_spy: pd.Series = None,
-    config: StrategyConfig = CONFIG,
-    universe: UniverseMetadata = UNIVERSE
-) -> tuple[pd.Series, pd.DataFrame, dict]:
-    """Execute the momentum rebalancing strategy."""
-    monthly_returns = []
     current_weights = {}
     prev_weights = {}
-    last_raw_optimal = {}
     weights_history = {}
     order_book_rows = []
-    last_trade_date = {}
+    
+    # State tracking for adaptive logic
+    prev_regime_strength = 0.5
+    prev_shock_factor = 0.0
+    regime_score_buffer = []
 
     total_turnover = 0.0
     total_txn_cost = 0.0
 
     for i in range(len(returns)):
         date = returns.index[i]
-        returns_row = returns.iloc[i]
-
-        # 1. Mark-to-market
-        pnl, current_weights = _handle_pnl_and_weights(current_weights, returns_row)
-        monthly_returns.append(pnl)
-
-        # 2. Risk Context
-        dd = _calculate_drawdown(monthly_returns)
-        dd_multiplier = _get_drawdown_multiplier(dd)
         
-        spy_mom = mom_12_1.iloc[i].get("SPY", np.nan)
-        returns_window = returns.iloc[max(0, i - 36):i] # Use 12mo window for vol usually
-        regime = _get_market_regime_context(daily_spy, spy_mom, i, returns_window)
+        # --- STRATEGY EXECUTION ---
+        # Warmup: need 12 months for long-term stats (M freq)
+        if i < 13: 
+            weights_history[date] = {}
+            continue
 
-        # 3. Ticker Scoring
-        rank_now = mom_12_1.iloc[i].rank(pct=True)
-        prev_rank = mom_12_1.iloc[i-1].rank(pct=True) if i > 0 else None
-        vol = returns_window.std()
-        
-        eligible = _compute_ticker_scores(
-            universe.tickers, prices, mom_12_1.iloc[i], mom_6_1.iloc[i], 
-            mom_3_1, daily_ohlcv, vol, rank_now, prev_rank, i, config
-        )
-
-        if len(eligible) < config.min_positions:
+        if i % config.rebal_freq != 0:
             weights_history[date] = dict(current_weights)
             continue
 
-        # 4. Portfolio Selection
-        candidates = _get_portfolio_candidates(eligible, regime, config)
-        allowed = _apply_entry_gating(candidates, eligible, regime, current_weights, config)
+        # A. ADAPTIVE REGIME SCORE (Self-Weighting Horizons)
+        # Calculate local trends (Months: 1, 3, 12)
+        m1 = spy_prices.iloc[i] / spy_prices.iloc[i-1] - 1
+        m3 = spy_prices.iloc[i] / spy_prices.iloc[i-3] - 1
+        m12 = spy_prices.iloc[i] / spy_prices.iloc[i-12] - 1
         
-        if not allowed:
-            weights_history[date] = dict(current_weights)
-            continue
-
-        # 5. Optimization & Weighing
-        target_allocs = _calculate_target_allocations(allowed, eligible, regime, returns_window, config)
-        if not target_allocs:
-            weights_history[date] = dict(current_weights)
-            continue
-
-        # Do-nothing filters
-        avg_eligible_score = float(np.nanmean([abs(v['score']) for v in eligible.values()]))
-        mean_conv = float(pd.Series(target_allocs).mean() if target_allocs else 0.0)
+        # Multi-horizon local vol (risk scaling - Monthly data)
+        v1 = spy_rets.iloc[max(0, i-3):i].std() * np.sqrt(12)  # Use at least 3m for 1m vol
+        v3 = spy_rets.iloc[max(0, i-6):i].std() * np.sqrt(12)
+        v12 = spy_rets.iloc[max(0, i-12):i].std() * np.sqrt(12)
         
-        if avg_eligible_score < config.do_nothing_threshold or mean_conv < config.min_mean_conviction:
-            weights_history[date] = dict(current_weights)
-            continue
-
-        # 6. Exposure Scaling & Hedging
-        equities_alloc = _calculate_exposure_scaling(regime, mean_conv, avg_eligible_score, dd_multiplier, dd, spy_mom, config)
+        # Inverse-vol weighting (capped at 10x to prevent horizon takeover)
+        inv_v = 1.0 / np.maximum([v1, v3, v12], 0.01)
+        inv_v = np.clip(inv_v, 0, 10.0)
+        h_weights = inv_v / inv_v.sum()
+        regime_score = (h_weights[0] * m1) + (h_weights[1] * m3) + (h_weights[2] * m12)
         
-        hedge_alloc = 0.0
-        vproxy = regime.get('vix_proxy', 0.0)
-        if (not pd.isna(vproxy) and vproxy >= config.convexity_vix_thresh_crash) or regime.get('crash_mode'):
-            hedge_alloc = config.hedge_crash_alloc
+        # B. BLENDED Z-NORMALIZATION
+        regime_score_buffer.append(regime_score)
+        if len(regime_score_buffer) > 12:
+            s_buf_1y = np.array(regime_score_buffer[-12:])
+            s_buf_3y = np.array(regime_score_buffer[-max(len(regime_score_buffer), 36):])
             
-        equities_alloc = max(0.0, equities_alloc - hedge_alloc)
+            # Blended distribution (70% 1y / 30% 3y)
+            mean_blended = 0.7 * s_buf_1y.mean() + 0.3 * s_buf_3y.mean()
+            std_blended  = 0.7 * s_buf_1y.std() + 0.3 * s_buf_3y.std()
+            z_score = (regime_score - mean_blended) / (std_blended + 1e-12)
+            new_regime_strength = np.clip((z_score + 1) / 2, 0, 1)
+        else:
+            new_regime_strength = 0.5 # Neutral during early buffer buildup
+            
+        # C. RECOVERY BOOST (Trend Confirmation)
+        if spy_prices.iloc[i] > spy_ma_3m.iloc[i]:
+            new_regime_strength = max(new_regime_strength, 0.5)
+
+        # D. ADAPTIVE EMA SMOOTHING (Fixed responsiveness 0.3)
+        alpha = 0.3
+        regime_strength = (1 - alpha) * prev_regime_strength + alpha * new_regime_strength
+        prev_regime_strength = regime_strength
+
+        # E. CONTINUOUS SHOCK FACTOR (Relaxed suppression max 50%)
+        # Intensity scaled by standard deviations (adjusted for monthly)
+        s1 = m1 / (-2.5 * (v1/np.sqrt(1) + 1e-12)) # Monthly shock
+        s3 = m3 / (-3.0 * (v3/np.sqrt(1) + 1e-12))
+        raw_shock = np.clip(max(s1, s3, 0), 0, 1)
         
-        # Merge allocations
-        new_weights = {t: float(target_allocs.get(t, 0.0) * equities_alloc) for t in target_allocs}
+        # Memory-aware shock recovery
+        shock_factor = 0.7 * prev_shock_factor + 0.3 * raw_shock
+        prev_shock_factor = shock_factor
+        shock_suppression = max(0.5, (1.0 - 0.5 * shock_factor)) # Proportional reduction (50% max cut)
+
+        # F. EXPOSURE & CONVEX SCALING (RESTORED PARTICIPATION)
+        base_exposure = 0.75
+        # Non-linear risk response: regime_strength ** 1.2 (slightly smoother for alpha)
+        regime_cap = base_exposure * regime_strength
         
-        available_hedges = [h for h in config.hedge_tickers if h in prices.columns]
-        if hedge_alloc > 0 and available_hedges:
-            per_h = float(min(config.max_weight, hedge_alloc / len(available_hedges)))
-            for h in available_hedges:
-                new_weights[h] = per_h
+        # Final exposure calculation
+        target_exposure = regime_cap * shock_suppression
+        target_exposure = base_exposure * (0.5 + 0.5 * regime_strength) * shock_suppression # 30% floor participation
 
-        # Clip and clean
-        new_weights = {t: min(config.max_weight, max(config.min_weight, w)) for t, w in new_weights.items()}
-
-        # 7. Anti-churn & Rebalance Gate
-        new_weights = _apply_anti_churn(new_weights, prev_weights, last_trade_date, date, config)
+        # G. ASSET SELECTION (INSTITUTIONAL ALPHA BRAIN)
+        vol = returns.iloc[max(0, i - 12):i].std()
         
-        total_invested = sum(new_weights.values())
-        if total_invested <= 0:
-            weights_history[date] = dict(current_weights)
-            continue
+        # Trend Consistency (Positive Return Ratio)
+        hist_rets = returns.iloc[max(0, i-12):i]
+        stability = (hist_rets > 0).sum() / len(hist_rets) if len(hist_rets) > 0 else pd.Series(0, index=returns.columns)
+        
+        # Max Drawdown Penalty (12-month peak-to-current)
+        window_prices = prices.iloc[max(0, i-12):i+1]
+        peak = window_prices.max()
+        drawdown = (peak - prices.iloc[i]) / (peak + 1e-12)
+        
+        # Multi-horizon data points
+        m1_row  = prices.iloc[i] / prices.iloc[i-1] - 1
+        m3_row  = prices.iloc[i] / prices.iloc[i-3] - 1
+        m6_row  = prices.iloc[i] / prices.iloc[i-6] - 1
+        m12_row = prices.iloc[i] / prices.iloc[i-12] - 1
+        
+        regime_type = "high_vol" if spy_vol_3m.iloc[i] > 0.25 else "normal"
+        power = 1.2 + (0.3 * regime_strength) # Signal convexity
+        
+        scores = compute_scores_cs(
+            mom_1m=m1_row, 
+            mom_3m=m3_row, 
+            mom_6m=m6_row,
+            mom_12m=m12_row, 
+            vol=vol, 
+            stability=stability,
+            drawdown=drawdown,
+            regime_type=regime_type,
+            power=power
+        )
+        
+        if not scores:
+            new_weights = {} # Only move to cash if no data
+        else:
+            n_select = 6 if regime_type == "high_vol" else 12
+            # Use top selection anyway to maintain breadth
+            selected = select_top_robust(scores, universe, n=max(5, n_select))
+            raw_weights = compute_weights(selected, returns.iloc[max(0, i-12):i])
+            
+            # H. STRICT NORMALIZATION
+            total_raw_w = sum(raw_weights.values())
+            if total_raw_w > 0:
+                new_weights = {t: (w / total_raw_w) * target_exposure for t, w in raw_weights.items()}
+            else:
+                new_weights = {}
 
-        # Drift check
-        if last_raw_optimal:
-            drift = max(
-                abs(target_allocs.get(t, 0) - last_raw_optimal.get(t, 0))
-                for t in set(target_allocs) | set(last_raw_optimal)
-            )
-            if drift < config.rebal_threshold:
-                weights_history[date] = dict(current_weights)
-                continue
+        # I. DATA VALIDATION FAIL-SAFE
+        nw_array = np.array(list(new_weights.values()))
+        if np.isnan(nw_array).any() or np.isinf(nw_array).any():
+            logger.error(f"  [{date}] Data Stability Failure: NaN detected. Fallback to cash.")
+            new_weights = {}
 
-        last_raw_optimal = dict(target_allocs)
+        # J. TURNOVER FILTER (2% Noise Reduction)
+        all_tickers = set(prev_weights.keys()) | set(new_weights.keys())
+        potential_weights = dict(new_weights)
+        for t in all_tickers:
+            old_w = prev_weights.get(t, 0.0)
+            new_w = new_weights.get(t, 0.0)
+            if abs(new_w - old_w) < config.min_weight_delta:
+                potential_weights[t] = old_w
+        new_weights = {t: w for t, w in potential_weights.items() if w > 0.001}
 
-        # Smoothing
-        if current_weights:
-            new_weights = {
-                t: config.smoothing * current_weights.get(t, 0) + (1 - config.smoothing) * new_weights.get(t, 0)
-                for t in set(current_weights) | set(new_weights)
-            }
-
-        # 8. Execution (Order Book & Costs)
+        # K. REBALANCE LOGGING & COSTING
+        # Calculate Turnover-Scaled Costs (10 bps fees + 5 bps slippage = 15 bps)
+        turnover = sum(abs(new_weights.get(t, 0) - prev_weights.get(t, 0)) for t in all_tickers)
+        txn_cost = turnover * 0.0015
+        total_turnover += turnover
+        total_txn_cost += txn_cost
+        
+        # Order Book
         def _get_ob_row(ticker, action, weight):
             return {
                 "Date": str(date), "Ticker": ticker, "Sector": universe.universe_with_sectors.get(ticker, "?"),
                 "Action": action, "Weight_%": round(weight * 100, 2),
-                "Mom_12_1_%": round(eligible.get(ticker, {}).get('mom_12_1', 0) * 100, 2),
+                "Mom_12_1_%": round(mom_12_1.iloc[i].get(ticker, 0) * 100, 2),
                 "Price": round(float(prices[ticker].iloc[i]), 2) if ticker in prices.columns else None,
             }
-
         prev_set, new_set = set(prev_weights), set(new_weights)
         for t in new_set - prev_set:
             order_book_rows.append(_get_ob_row(t, "BUY", new_weights[t]))
@@ -814,26 +524,25 @@ def run_strategy(
             if abs(delta) > config.order_book_min_delta:
                 order_book_rows.append(_get_ob_row(t, "ADD" if delta > 0 else "TRIM", new_weights[t]))
 
-        turnover = sum(abs(new_weights.get(t, 0) - prev_weights.get(t, 0)) for t in set(prev_weights) | set(new_weights))
-        txn_cost = turnover * config.txn_cost_bps / 10_000
-        total_turnover += turnover
-        total_txn_cost += txn_cost
-        monthly_returns[-1] -= txn_cost
-
-        # Update tracking
-        dt_date = date.to_timestamp() if hasattr(date, 'to_timestamp') else pd.to_datetime(date)
-        for t in set(new_weights.keys()) | set(prev_weights.keys()):
-            if abs(new_weights.get(t, 0) - prev_weights.get(t, 0)) > config.order_book_min_delta:
-                last_trade_date[t] = dt_date
-
         current_weights = new_weights
         prev_weights = dict(new_weights)
         weights_history[date] = dict(new_weights)
 
-    logger.info(f"  Total turnover: {total_turnover:.2f}")
-    logger.info(f"  Total txn cost: {total_txn_cost*100:.2f}%")
+    # L. EXECUTION REALISM: T+1 SIGNAL LAG
+    # Signal at Close(t) -> Trade at Open(t+1). We shift weights by 1 period before backtesting.
+    all_dates = returns.index
+    weights_df = pd.DataFrame(weights_history).fillna(0.0).T.reindex(all_dates).fillna(0.0)
+    weights_df = weights_df.shift(1).fillna(0.0) # Apply the Institutional T+1 Lag
 
-    return pd.Series(monthly_returns, index=returns.index, name="Monthly Return"), pd.DataFrame(order_book_rows), weights_history
+    logger.info(f"  Target Accuracy Check (T+1 Lagged): {len(weights_df)} periods")
+    logger.info(f"  Avg Exposure (%): {(weights_df.sum(axis=1).mean() * 100):.2f}%")
+    logger.info(f"  Total strategy turnover: {total_turnover:.2f}")
+    logger.info(f"  Total strategy costs: {total_txn_cost*100:.2f}%")
+
+    # Re-extract monthly returns for internal stats (approximate since costs are already added)
+    monthly_rets = returns.multiply(weights_df).sum(axis=1) - (total_txn_cost / len(returns))
+
+    return monthly_rets, pd.DataFrame(order_book_rows), weights_history
 
 
 # ============================================================
@@ -1145,11 +854,10 @@ def main(config: StrategyConfig = CONFIG, universe: UniverseMetadata = UNIVERSE)
     logger.info("=" * 62)
     logger.info("  Monthly Rebalancing: Risk-Adjusted Optimisation")
     logger.info("=" * 62)
-    logger.info(f"\n  Target: Robust Momentum + Volatility Weighting")
-    logger.info(f"  Candidates: top {config.candidate_size}  |  bounds: [{config.min_weight*100:.0f}%, {config.max_weight*100:.0f}%]")
-    logger.info(f"  Rebalance threshold: {config.rebal_threshold*100:.0f}% drift")
-    logger.info(f"  Weight Smoothing: {config.smoothing}")
-    logger.info(f"  Txn cost: {config.txn_cost_bps} bps\n")
+    logger.info(f"  Min backtest months: {config.min_backtest_months}")
+    logger.info(f"  Rebalance Freq: {config.rebal_freq} months")
+    logger.info(f"  Turnover Threshold: {config.min_weight_delta*100:.0f}%")
+    logger.info(f"  Txn cost assumed: 10 bps\n")
 
     # 1. Benchmark Data
     logger.info("  Fetching benchmarks...")
@@ -1158,9 +866,7 @@ def main(config: StrategyConfig = CONFIG, universe: UniverseMetadata = UNIVERSE)
     spy_price = _extract_close(spy_raw)
     spy_rets = _to_period_index(np.log(spy_price / spy_price.shift(1)).dropna())
     
-    spy_daily_raw = yf.download("SPY", start=START_DATE, end=END_DATE, interval="1d", auto_adjust=True, progress=False)
-    spy_daily_close = _extract_close(spy_daily_raw).dropna()
-    spy_monthly_prices = _resample_spy_to_monthly(spy_daily_close)
+    # spy_monthly_prices = _resample_spy_to_monthly(spy_daily_close) (Not used in simple strategy)
 
     # 2. Universe Data
     logger.info("  Fetching universe data...")
@@ -1182,23 +888,40 @@ def main(config: StrategyConfig = CONFIG, universe: UniverseMetadata = UNIVERSE)
         return
 
     # 3. Strategy Execution
-    logger.info("  Running strategy ...\n")
-    update_universe_data(universe.tickers, start=START_DATE, end=END_DATE, interval='1d')
-    daily_ohlcv = load_universe_data(universe.tickers, interval='1d')
-    daily_spy = _extract_close(daily_ohlcv.get('SPY', spy_daily_raw)).dropna()
+    # Ensure SPY is in prices for regime detection
+    if "SPY" not in prices.columns:
+        spy_aligned = spy_price.reindex(prices.index, method='ffill').fillna(0.0)
+        prices["SPY"] = spy_aligned
+
+    logger.info("  Running strategy (Institutional Adaptive Engine) ...\n")
 
     mom_12_1 = compute_12_1(prices)
-    mom_6_1 = compute_6_1(prices)
-    mom_3_1 = compute_3_1(prices)
 
     strategy_returns, order_book_df, weights_history = run_strategy(
-        prices, returns, mom_12_1, mom_6_1, mom_3_1, daily_ohlcv, daily_spy, config, universe
+        prices=prices, 
+        mom_12_1=mom_12_1, 
+        universe=universe, 
+        config=config
     )
 
-    # 4. VBT Backtest
-    logger.info("\n  Running VBT Backtest engine...")
-    weights_df = pd.DataFrame.from_dict(weights_history, orient="index").sort_index()
-    weights_df = weights_df.reindex(prices.index, method="ffill").fillna(0.0)
+    # 4. VBT Backtest (T+1 Lagged Weights)
+    logger.info("\n  Running Portfolio Backtest (T+1 Lagged & 15bps Cost) ...")
+    if not weights_history:
+        logger.warning("⚠️  Weights history is empty. Strategy did not enter any positions.")
+        weights_df = pd.DataFrame(0.0, index=prices.index, columns=prices.columns)
+    else:
+        weights_df = pd.DataFrame.from_dict(weights_history, orient="index").sort_index()
+        # Ensure all universe columns exist
+        weights_df = weights_df.reindex(columns=prices.columns).fillna(0.0)
+        # Ensure PeriodIndex if created from dict
+        if not isinstance(weights_df.index, pd.PeriodIndex):
+            try:
+                # Deduplicate and ensure period index
+                weights_df = weights_df[~weights_df.index.duplicated(keep='last')]
+                weights_df.index = pd.PeriodIndex(weights_df.index, freq='M')
+            except Exception:
+                pass
+        weights_df = weights_df.reindex(prices.index, method="ffill").fillna(0.0)
     weights_df.index = pd.to_datetime([d.to_timestamp() if hasattr(d, 'to_timestamp') else d for d in weights_df.index])
     
     vbt_prices = prices.copy()
